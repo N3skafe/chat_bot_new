@@ -99,7 +99,7 @@ def process_pdf_upload(pdf_file_obj): # 파라미터 이름을 명확히 (Gradio
 # Gradio 앱 구성
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 멀티 에이전트 AI 챗봇 (Ollama & RAG)")
-    gr.Markdown("코딩/수학 문제는 `deepseek-coder`, 복잡한 추론은 `llama3`, 일반 질문은 `gemma`가 처리합니다. PDF를 업로드하여 RAG 기능을 사용할 수 있고, 이미지도 업로드하여 분석할 수 있습니다.")
+    gr.Markdown("코딩/수학 문제는 `deepseek-r1`, 복잡한 추론은 `llama3`, 일반 질문은 `gemma`가 처리합니다. PDF를 업로드하여 RAG 기능을 사용할 수 있고, 이미지도 업로드하여 분석할 수 있습니다.")
 
     with gr.Row():
         with gr.Column(scale=3): # 채팅창 영역을 조금 더 넓게 조정 (예시)
@@ -135,7 +135,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             gr.Markdown(
                 """
                 - **라우팅 및 에이전트 관리**: LangGraph
-                - **코딩/수학**: `deepseek-coder:6.7b` (예시)
+                - **코딩/수학**: `deepseek-r1:lastest` (예시)
                 - **복잡한 추론/이미지**: `llama3:8b` (예시, 이미지 분석은 `llava` 또는 multimodal `llama3` 변형)
                 - **일반 질문**: `gemma:2b` (예시)
                 - **임베딩**: `nomic-embed-text` (예시)
