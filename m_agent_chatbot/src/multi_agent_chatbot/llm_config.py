@@ -1,5 +1,7 @@
 from langchain_community.chat_models import ChatOllama
 from langchain_community.embeddings import OllamaEmbeddings
+# from langchain_ollama import ChatOllama, OllamaEmbeddings
+
 
 # Ollama 서버 주소 (필요시 변경)
 OLLAMA_BASE_URL = "http://localhost:11434"

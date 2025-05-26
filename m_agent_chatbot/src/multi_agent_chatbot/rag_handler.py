@@ -1,9 +1,10 @@
 import os
 from pathlib import Path
 from typing import List, Tuple, Optional
+import shutil
 
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores.chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
@@ -16,12 +17,63 @@ PDF_STORAGE_PATH = str(Path(__file__).parent.parent.parent / "data" / "pdfs")
 os.makedirs(CHROMA_DB_PATH, exist_ok=True)
 os.makedirs(PDF_STORAGE_PATH, exist_ok=True)
 
-# ChromaDB 클라이언트 초기화 (메모리 또는 영구 저장소)
-vectorstore = Chroma(
-    embedding_function=embeddings,
-    persist_directory=CHROMA_DB_PATH,
-    collection_name="rag_collection"
-)
+def initialize_chroma():
+    """Initialize ChromaDB with proper error handling and cleanup if needed."""
+    global CHROMA_DB_PATH  # Add global declaration
+    
+    try:
+        # Try to initialize ChromaDB
+        vectorstore = Chroma(
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DB_PATH,
+            collection_name="rag_collection"
+        )
+        return vectorstore
+    except Exception as e:
+        print(f"Error initializing ChromaDB: {e}")
+        print("Attempting to clean up and reinitialize...")
+        
+        try:
+            # Backup the existing database
+            backup_path = f"{CHROMA_DB_PATH}_backup"
+            if os.path.exists(CHROMA_DB_PATH):
+                # Try to remove the backup directory if it exists
+                if os.path.exists(backup_path):
+                    try:
+                        shutil.rmtree(backup_path)
+                    except Exception as backup_error:
+                        print(f"Warning: Could not remove existing backup: {backup_error}")
+                
+                # Try to copy instead of move
+                try:
+                    shutil.copytree(CHROMA_DB_PATH, backup_path)
+                    shutil.rmtree(CHROMA_DB_PATH)
+                except Exception as copy_error:
+                    print(f"Warning: Could not backup database: {copy_error}")
+                    # If backup fails, try to just remove the directory
+                    try:
+                        shutil.rmtree(CHROMA_DB_PATH)
+                    except Exception as remove_error:
+                        print(f"Warning: Could not remove database directory: {remove_error}")
+                        # If all else fails, try to create a new directory with a different name
+                        CHROMA_DB_PATH = f"{CHROMA_DB_PATH}_new"
+        
+        except Exception as cleanup_error:
+            print(f"Error during cleanup: {cleanup_error}")
+            # If cleanup fails, try to use a new directory
+            CHROMA_DB_PATH = f"{CHROMA_DB_PATH}_new"
+        
+        # Create a new database
+        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
+        vectorstore = Chroma(
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DB_PATH,
+            collection_name="rag_collection"
+        )
+        return vectorstore
+
+# Initialize ChromaDB with error handling
+vectorstore = initialize_chroma()
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
