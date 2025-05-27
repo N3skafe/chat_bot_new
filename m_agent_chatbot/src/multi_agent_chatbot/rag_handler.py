@@ -10,6 +10,7 @@ import chromadb
 import json
 import uuid
 import atexit
+import hashlib
 
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader
 from langchain_community.vectorstores.chroma import Chroma
@@ -42,6 +43,16 @@ pdf_index = {}  # PDF 파일 경로와 ID 매핑
 
 # 정리할 데이터베이스 목록
 databases_to_cleanup = set()
+
+# 텍스트 분할기 초기화
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len
+)
+
+# ChromaDB 초기화
+vectorstore = None
 
 def save_pdf_metadata():
     """PDF 메타데이터를 파일에 저장합니다."""
@@ -130,53 +141,45 @@ def register_cleanup(db_path):
 # 프로그램 종료 시 정리 작업 등록
 atexit.register(cleanup_old_databases)
 
-def initialize_chroma(force_recreate: bool = False):
-    """Initialize ChromaDB with proper error handling and cleanup if needed."""
-    global CHROMA_DB_PATH
-    
-    try:
-        # Try to initialize ChromaDB
-        vectorstore = Chroma(
-            embedding_function=embeddings,
-            persist_directory=CHROMA_DB_PATH,
-            collection_name="rag_collection"
-        )
-        return vectorstore
-    except Exception as e:
-        print(f"Error initializing ChromaDB: {e}")
-        print("Attempting to create new database...")
-        
-        # Generate new database path
-        new_db_path = get_new_db_path()
-        print(f"Creating new database at: {new_db_path}")
-        
-        # Create new database directory
-        os.makedirs(new_db_path, exist_ok=True)
-        
-        # Register old database for cleanup
-        if CHROMA_DB_PATH != BASE_CHROMA_DB_PATH:
-            register_cleanup(CHROMA_DB_PATH)
-        
-        # Update global path
-        CHROMA_DB_PATH = new_db_path
-        
-        # Create new ChromaDB instance
-        vectorstore = Chroma(
-            embedding_function=embeddings,
-            persist_directory=CHROMA_DB_PATH,
-            collection_name="rag_collection"
-        )
-        
-        return vectorstore
+def calculate_file_hash(file_path: str) -> str:
+    """Calculate SHA-256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
-# Initialize ChromaDB with error handling
-vectorstore = initialize_chroma(force_recreate=True)  # Force recreate on first run
+def is_duplicate_file(file_path: str) -> Optional[str]:
+    """Check if file is a duplicate based on content hash."""
+    file_hash = calculate_file_hash(file_path)
+    for pdf_id, info in pdf_index.items():
+        if os.path.exists(info["path"]):
+            existing_hash = calculate_file_hash(info["path"])
+            if existing_hash == file_hash:
+                return pdf_id
+    return None
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-    length_function=len
-)
+def update_pdf_status(pdf_id: str, status: str, error_message: Optional[str] = None):
+    """Update PDF processing status and save metadata."""
+    if pdf_id in pdf_metadata:
+        pdf_metadata[pdf_id]["status"] = status
+        if error_message:
+            pdf_metadata[pdf_id]["error"] = error_message
+        pdf_metadata[pdf_id]["last_updated"] = datetime.now().isoformat()
+        save_pdf_metadata()
+
+def retry_failed_pdfs():
+    """Retry processing of failed PDFs."""
+    for pdf_id, info in pdf_metadata.items():
+        if info["status"] == "failed" and pdf_id in pdf_index:
+            pdf_path = pdf_index[pdf_id]["path"]
+            if os.path.exists(pdf_path):
+                print(f"Retrying failed PDF: {pdf_path}")
+                update_pdf_status(pdf_id, "processing")
+                if process_and_embed_pdf(pdf_path):
+                    update_pdf_status(pdf_id, "processed")
+                else:
+                    update_pdf_status(pdf_id, "failed", "Retry failed")
 
 def process_and_embed_pdf(pdf_file_path: str) -> bool:
     """
@@ -185,6 +188,24 @@ def process_and_embed_pdf(pdf_file_path: str) -> bool:
     """
     try:
         print(f"Processing PDF: {pdf_file_path}")
+        
+        # 중복 파일 체크
+        duplicate_id = is_duplicate_file(pdf_file_path)
+        if duplicate_id:
+            print(f"Duplicate file detected. Reusing existing data for {pdf_file_path}")
+            update_pdf_status(duplicate_id, "processed")
+            return True
+
+        # PDF ID 찾기
+        pdf_id = None
+        for pid, info in pdf_index.items():
+            if info["path"] == pdf_file_path:
+                pdf_id = pid
+                break
+
+        if pdf_id:
+            update_pdf_status(pdf_id, "processing")
+
         # PyPDFLoader 사용 (더 안정적인 PDF 처리)
         loader = PyPDFLoader(pdf_file_path)
         
@@ -199,42 +220,54 @@ def process_and_embed_pdf(pdf_file_path: str) -> bool:
                 print(f"Found {len(js_codes)} JavaScript blocks in a chunk. Converting to Python...")
                 for js_code in js_codes:
                     python_code = convert_js_to_python_code(js_code, llm_coding)
-                    # 원본 JS 코드를 변환된 Python 코드로 대체
                     content = content.replace(js_code, f"\n'''\nOriginal JavaScript:\n{js_code}\n'''\n\n'''\nConverted Python:\n{python_code}\n'''\n")
                 
-                # 변환된 내용을 포함하는 새 Document 객체 생성 또는 기존 Document 업데이트
                 doc.page_content = content
 
             processed_docs.append(doc)
 
         if not processed_docs:
-            print(f"No text could be extracted from {pdf_file_path}")
+            error_msg = f"No text could be extracted from {pdf_file_path}"
+            if pdf_id:
+                update_pdf_status(pdf_id, "failed", error_msg)
             return False
 
         split_docs = text_splitter.split_documents(processed_docs)
         
         if not split_docs:
-            print(f"No text chunks generated after splitting for {pdf_file_path}")
+            error_msg = f"No text chunks generated after splitting for {pdf_file_path}"
+            if pdf_id:
+                update_pdf_status(pdf_id, "failed", error_msg)
             return False
             
         vectorstore.add_documents(split_docs)
-        vectorstore.persist() # 변경사항 디스크에 저장
-        print(f"Successfully processed and embedded {pdf_file_path}")
+        vectorstore.persist()
+        
+        if pdf_id:
+            update_pdf_status(pdf_id, "processed")
+        
         return True
+        
     except Exception as e:
-        print(f"Error processing PDF {pdf_file_path}: {e}")
-        import traceback
-        traceback.print_exc()
+        error_msg = f"Error processing PDF {pdf_file_path}: {str(e)}"
+        logger.error(error_msg)
+        if pdf_id:
+            update_pdf_status(pdf_id, "failed", error_msg)
         return False
 
 def get_relevant_documents(query: str, k: int = 5) -> List[Document]:
     """Vector DB에서 관련 문서를 검색합니다."""
+    global vectorstore
     try:
+        if vectorstore is None:
+            vectorstore = initialize_chroma(force_recreate=False)
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
         relevant_docs = retriever.invoke(query)
         return relevant_docs
     except Exception as e:
-        print(f"Error querying RAG: {e}")
+        logger.error(f"Error querying RAG: {e}")
+        # 오류 발생 시 DB 재초기화 시도
+        vectorstore = initialize_chroma(force_recreate=True)
         return []
 
 def query_pdf_content(query: str, k: int = 5) -> str:
@@ -279,3 +312,52 @@ def get_processed_pdfs() -> List[Dict]:
         }
         for info in pdf_index.values()
     ]
+
+def initialize_chroma(force_recreate: bool = False) -> Chroma:
+    """Initialize or load existing ChromaDB."""
+    global CHROMA_DB_PATH, vectorstore
+    
+    if not force_recreate and os.path.exists(BASE_CHROMA_DB_PATH):
+        CHROMA_DB_PATH = BASE_CHROMA_DB_PATH
+        print(f"Using existing ChromaDB at {CHROMA_DB_PATH}")
+    else:
+        CHROMA_DB_PATH = get_new_db_path()
+        print(f"Creating new ChromaDB at {CHROMA_DB_PATH}")
+    
+    try:
+        vectorstore = Chroma(
+            persist_directory=CHROMA_DB_PATH,
+            embedding_function=embeddings,
+            collection_name="rag_collection"
+        )
+        return vectorstore
+    except Exception as e:
+        logger.error(f"Error initializing ChromaDB: {e}")
+        # 오류 발생 시 새로운 DB 생성
+        CHROMA_DB_PATH = get_new_db_path()
+        vectorstore = Chroma(
+            persist_directory=CHROMA_DB_PATH,
+            embedding_function=embeddings,
+            collection_name="rag_collection"
+        )
+        return vectorstore
+
+# ChromaDB 초기화 실행
+vectorstore = initialize_chroma(force_recreate=False)
+
+# 주기적으로 실패한 PDF 재처리 시도
+def start_pdf_retry_scheduler():
+    """Start a background thread to periodically retry failed PDFs."""
+    import threading
+    import time
+
+    def retry_worker():
+        while True:
+            retry_failed_pdfs()
+            time.sleep(300)  # 5분마다 재시도
+
+    thread = threading.Thread(target=retry_worker, daemon=True)
+    thread.start()
+
+# 초기화 시 실패한 PDF 재처리 시작
+start_pdf_retry_scheduler()

@@ -8,6 +8,7 @@ import operator
 from .llm_config import AVAILABLE_MODELS, llm_general, llm_coding, llm_reasoning, llm_image
 from .rag_handler import get_relevant_documents, query_pdf_content
 from .image_handler import analyze_image_with_llm
+from .web_search import search_web, format_search_results
 from PIL import Image
 
 
@@ -18,7 +19,8 @@ class AgentState(TypedDict):
     image_data: Optional[Image.Image] # PIL Image
     image_analysis_result: Optional[str]
     rag_context: Optional[str]
-    selected_agent: Literal["coding_math", "reasoning", "general", "rag", "image_analysis_route"]
+    web_search_results: Optional[str]
+    selected_agent: Literal["coding_math", "reasoning", "general", "rag", "image_analysis_route", "web_search"]
     output_message: Optional[str]
     intermediate_steps: list # 디버깅용
 
@@ -31,6 +33,27 @@ def route_query_node(state: AgentState) -> AgentState:
     # 이미지 분석이 우선순위가 높을 경우
     if image_data:
         return {"selected_agent": "image_analysis_route"}
+
+    # 웹 검색이 필요한 경우
+    web_search_keywords = [
+        # 일반적인 검색 요청
+        "검색", "찾아봐", "알려줘", "뭐야", "무엇", "어떻게", "왜", "언제", "어디서",
+        # 시간 관련
+        "현재", "지금", "요즘", "최근", "이번", "올해", "작년", "내년",
+        # 상태/상황 관련
+        "상태", "상황", "동향", "트렌드", "뉴스", "소식", "정보",
+        # 특정 주제
+        "가격", "시세", "환율", "주식", "날씨", "기후", "날씨",
+        # 질문 형식
+        "누구", "무엇", "어디", "언제", "왜", "어떻게", "얼마",
+        # 영어 키워드
+        "what", "who", "when", "where", "why", "how", "current", "latest", "news",
+        # 추가 키워드
+        "최신", "업데이트", "변경", "발생", "진행", "예정", "계획"
+    ]
+    
+    if any(kw in query for kw in web_search_keywords):
+        return {"selected_agent": "web_search"}
 
     # RAG 사용 여부 판단
     if any(kw in query for kw in ["pdf", "문서", "내 파일", "내 자료", "찾아줘", "검색", "요약"]):
@@ -89,6 +112,36 @@ def rag_node(state: AgentState) -> AgentState:
         "intermediate_steps": state.get("intermediate_steps", []) + [f"RAG context retrieved: {context[:200]}..."]
     }
 
+def web_search_node(state: AgentState) -> AgentState:
+    """웹 검색을 수행하고 결과를 상태에 저장합니다."""
+    query = state["input_query"]
+    
+    print(f"Performing web search for: {query}")
+    try:
+        search_results = search_web(query)
+        if not search_results:
+            return {
+                "output_message": "웹 검색 결과를 찾을 수 없습니다. 다른 키워드로 다시 시도해주세요.",
+                "web_search_results": None,
+                "intermediate_steps": state.get("intermediate_steps", []) + ["Web search: No results found"]
+            }
+        
+        formatted_results = format_search_results(search_results)
+        print(f"Web search results: {formatted_results[:200]}...")
+        
+        return {
+            "web_search_results": formatted_results,
+            "intermediate_steps": state.get("intermediate_steps", []) + [f"Web search results: {formatted_results[:200]}..."]
+        }
+    except Exception as e:
+        error_msg = f"웹 검색 중 오류가 발생했습니다: {str(e)}"
+        print(error_msg)
+        return {
+            "output_message": error_msg,
+            "web_search_results": None,
+            "intermediate_steps": state.get("intermediate_steps", []) + [f"Web search error: {str(e)}"]
+        }
+
 def llm_call_node(state: AgentState) -> AgentState:
     """선택된 에이전트(LLM)를 호출하고 응답을 생성합니다."""
     agent_name = state["selected_agent"]
@@ -96,39 +149,49 @@ def llm_call_node(state: AgentState) -> AgentState:
     history = state["chat_history"]
     rag_context = state.get("rag_context")
     image_analysis_context = state.get("image_analysis_result")
+    web_search_context = state.get("web_search_results")
 
-    llm = AVAILABLE_MODELS.get(agent_name)
-    if not llm:
-        llm = llm_general 
-        model_name = "qwen3:latest"
-        
-        if image_analysis_context and rag_context:
-            effective_query = f"이미지 분석 결과: {image_analysis_context}\n\n문서 내용: {rag_context}\n\n위 정보를 바탕으로 다음 질문에 답해주세요: {query}"
-        elif image_analysis_context:
-            effective_query = f"이미지 분석 결과: {image_analysis_context}\n\n위 정보를 바탕으로 다음 질문에 답해주세요: {query}"
-        elif rag_context:
-            effective_query = f"문서 내용: {rag_context}\n\n위 정보를 바탕으로 다음 질문에 답해주세요: {query}"
+    # 웹 검색 결과가 있는 경우 llama3.2:latest 모델 사용
+    if web_search_context:
+        llm = llm_reasoning  # llama3.2:latest 모델
+        model_name = "llama3.2:latest"
+        effective_query = f"다음은 웹 검색 결과입니다:\n{web_search_context}\n\n이 정보를 바탕으로 다음 질문에 답해주세요: {query}"
+    else:
+        llm = AVAILABLE_MODELS.get(agent_name)
+        if not llm:
+            llm = llm_general 
+            model_name = "qwen3:latest"
+            
+            # 컨텍스트 조합
+            contexts = []
+            if image_analysis_context:
+                contexts.append(f"이미지 분석 결과: {image_analysis_context}")
+            if rag_context:
+                contexts.append(f"문서 내용: {rag_context}")
+            
+            if contexts:
+                effective_query = f"{' '.join(contexts)}\n\n위 정보를 바탕으로 다음 질문에 답해주세요: {query}"
+            else:
+                effective_query = query
         else:
             effective_query = query
-    else:
-        effective_query = query
-        if image_analysis_context:
-            effective_query = f"참고 이미지 분석: {image_analysis_context}\n\n질문: {query}"
-        if rag_context:
-            effective_query = f"참고 문서: {rag_context}\n\n질문: {effective_query}"
-        
-        if agent_name == "coding_math":
-            model_name = "deepseek-r1:latest"
-        elif agent_name == "reasoning":
-            model_name = "llama3.2:latest"
-        elif agent_name == "general":
-            model_name = "qwen3:latest"
-        elif agent_name == "image_analysis":
-            model_name = "llava:7b"
-        else:
-            model_name = "unknown"
+            if image_analysis_context:
+                effective_query = f"참고 이미지 분석: {image_analysis_context}\n\n질문: {query}"
+            if rag_context:
+                effective_query = f"참고 문서: {rag_context}\n\n질문: {effective_query}"
+            
+            if agent_name == "coding_math":
+                model_name = "deepseek-r1:latest"
+            elif agent_name == "reasoning":
+                model_name = "llama3.2:latest"
+            elif agent_name == "general":
+                model_name = "qwen3:latest"
+            elif agent_name == "image_analysis":
+                model_name = "llava:7b"
+            else:
+                model_name = "unknown"
 
-    print(f"Calling LLM ({agent_name if agent_name in AVAILABLE_MODELS else 'general_fallback'}) with query: {effective_query[:200]}...")
+    print(f"Calling LLM ({model_name}) with query: {effective_query[:200]}...")
 
     prompt_messages = [SystemMessage(content="You are a helpful AI assistant.")]
     if history:
@@ -153,6 +216,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("query_router", route_query_node)
 workflow.add_node("image_analyzer", image_analysis_node)
 workflow.add_node("rag_retriever", rag_node)
+workflow.add_node("web_searcher", web_search_node)
 workflow.add_node("coding_math_agent", llm_call_node)
 workflow.add_node("reasoning_agent", llm_call_node)
 workflow.add_node("general_agent", llm_call_node)
@@ -166,6 +230,8 @@ def decide_next_step_after_routing(state: AgentState):
         return "image_analyzer"
     elif state["selected_agent"] == "rag":
         return "rag_retriever"
+    elif state["selected_agent"] == "web_search":
+        return "web_searcher"
     elif state["selected_agent"] == "coding_math":
         return "coding_math_agent"
     elif state["selected_agent"] == "reasoning":
@@ -179,6 +245,7 @@ workflow.add_conditional_edges(
     {
         "image_analyzer": "image_analyzer",
         "rag_retriever": "rag_retriever",
+        "web_searcher": "web_searcher",
         "coding_math_agent": "coding_math_agent",
         "reasoning_agent": "reasoning_agent",
         "general_agent": "general_agent",
@@ -190,6 +257,7 @@ def decide_after_preprocessing(state: AgentState):
 
 workflow.add_edge("image_analyzer", "final_llm_call")
 workflow.add_edge("rag_retriever", "final_llm_call")
+workflow.add_edge("web_searcher", "final_llm_call")
 
 workflow.add_edge("coding_math_agent", END)
 workflow.add_edge("reasoning_agent", END)
@@ -212,6 +280,7 @@ def run_graph(query: str, chat_history: List[Tuple[str, str]], image_pil: Option
         "image_data": image_pil,
         "image_analysis_result": None,
         "rag_context": None,
+        "web_search_results": None,
         "selected_agent": "general",
         "output_message": None,
         "intermediate_steps": []
