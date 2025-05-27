@@ -31,7 +31,7 @@ def get_llm(model_name: str, temperature: float = 0.1):
 llm_coding = get_llm(MODEL_DEEPSEEK)
 llm_reasoning = get_llm(MODEL_LLAMA3) # 이미지 분석도 이 모델로 시도
 llm_general = get_llm(MODEL_QWEN3)
-llm_image_analysis = get_llm(MODEL_IMAGE_ANALYSIS) # 별도 이미지 분석 모델
+llm_image = get_llm(MODEL_IMAGE_ANALYSIS) # 별도 이미지 분석 모델
 
 # 임베딩 모델
 embeddings = OllamaEmbeddings(
@@ -44,5 +44,5 @@ AVAILABLE_MODELS = {
     "coding_math": llm_coding,
     "reasoning": llm_reasoning,
     "general": llm_general,
-    "image_analysis": llm_image_analysis # 이미지 분석용
+    "image_analysis": llm_image # 이미지 분석용
 }

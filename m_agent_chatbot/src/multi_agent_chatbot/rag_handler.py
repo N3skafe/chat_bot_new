@@ -1,25 +1,138 @@
 import os
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+import time
+import tempfile
 import shutil
+import logging
+from datetime import datetime
+import chromadb
+import json
+import uuid
+import atexit
 
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredPDFLoader
 from langchain_community.vectorstores.chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
 
-from .llm_config import embeddings, llm_coding # JS 변환에 코딩 LLM 사용
+from .llm_config import embeddings, llm_general, llm_coding
 from .utils import extract_javascript_from_text, convert_js_to_python_code
 
-CHROMA_DB_PATH = str(Path(__file__).parent.parent.parent / "data" / "chroma_db")
-PDF_STORAGE_PATH = str(Path(__file__).parent.parent.parent / "data" / "pdfs")
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-os.makedirs(PDF_STORAGE_PATH, exist_ok=True)
+# 데이터 디렉토리 설정
+BASE_DIR = Path(__file__).parent.parent.parent
+BASE_CHROMA_DB_PATH = str(BASE_DIR / "data" / "chroma_db")
+PDF_STORAGE_PATH = str(BASE_DIR / "data" / "pdfs")
+PDF_METADATA_PATH = str(BASE_DIR / "data" / "pdf_metadata.json")
+PDF_INDEX_PATH = str(BASE_DIR / "data" / "pdf_index.json")
 
-def initialize_chroma():
+# 현재 사용 중인 ChromaDB 경로 (기본값으로 초기화)
+CHROMA_DB_PATH = BASE_CHROMA_DB_PATH
+
+# PDF 메타데이터 관리
+pdf_metadata = {}
+pdf_index = {}  # PDF 파일 경로와 ID 매핑
+
+# 정리할 데이터베이스 목록
+databases_to_cleanup = set()
+
+def save_pdf_metadata():
+    """PDF 메타데이터를 파일에 저장합니다."""
+    with open(PDF_METADATA_PATH, 'w', encoding='utf-8') as f:
+        json.dump(pdf_metadata, f, ensure_ascii=False, indent=2)
+
+def load_pdf_metadata():
+    """PDF 메타데이터를 파일에서 로드합니다."""
+    global pdf_metadata
+    if os.path.exists(PDF_METADATA_PATH):
+        with open(PDF_METADATA_PATH, 'r', encoding='utf-8') as f:
+            pdf_metadata = json.load(f)
+
+def save_pdf_index():
+    """PDF 인덱스를 파일에 저장합니다."""
+    with open(PDF_INDEX_PATH, 'w', encoding='utf-8') as f:
+        json.dump(pdf_index, f, ensure_ascii=False, indent=2)
+
+def load_pdf_index():
+    """PDF 인덱스를 파일에서 로드합니다."""
+    global pdf_index
+    if os.path.exists(PDF_INDEX_PATH):
+        with open(PDF_INDEX_PATH, 'r', encoding='utf-8') as f:
+            pdf_index = json.load(f)
+
+# 메타데이터와 인덱스 로드
+load_pdf_metadata()
+load_pdf_index()
+
+def get_new_db_path():
+    """Generate a new unique database path."""
+    return f"{BASE_CHROMA_DB_PATH}_{uuid.uuid4().hex[:8]}"
+
+def cleanup_database(db_path):
+    """Clean up a single database directory."""
+    if not os.path.exists(db_path):
+        return
+    
+    try:
+        # 먼저 SQLite 파일을 삭제
+        sqlite_file = os.path.join(db_path, "chroma.sqlite3")
+        if os.path.exists(sqlite_file):
+            try:
+                os.remove(sqlite_file)
+            except Exception as e:
+                print(f"Warning: Could not remove SQLite file {sqlite_file}: {e}")
+                return False
+        
+        # 나머지 파일들 삭제
+        for root, dirs, files in os.walk(db_path, topdown=False):
+            for name in files:
+                try:
+                    os.remove(os.path.join(root, name))
+                except Exception as e:
+                    print(f"Warning: Could not remove file {name}: {e}")
+            for name in dirs:
+                try:
+                    os.rmdir(os.path.join(root, name))
+                except Exception as e:
+                    print(f"Warning: Could not remove directory {name}: {e}")
+        
+        # 마지막으로 디렉토리 삭제
+        try:
+            os.rmdir(db_path)
+            return True
+        except Exception as e:
+            print(f"Warning: Could not remove directory {db_path}: {e}")
+            return False
+    except Exception as e:
+        print(f"Error cleaning up database {db_path}: {e}")
+        return False
+
+def cleanup_old_databases():
+    """Clean up old database directories."""
+    global databases_to_cleanup
+    
+    for db_path in list(databases_to_cleanup):
+        if cleanup_database(db_path):
+            databases_to_cleanup.remove(db_path)
+
+def register_cleanup(db_path):
+    """Register a database for cleanup."""
+    global databases_to_cleanup
+    databases_to_cleanup.add(db_path)
+
+# 프로그램 종료 시 정리 작업 등록
+atexit.register(cleanup_old_databases)
+
+def initialize_chroma(force_recreate: bool = False):
     """Initialize ChromaDB with proper error handling and cleanup if needed."""
-    global CHROMA_DB_PATH  # Add global declaration
+    global CHROMA_DB_PATH
     
     try:
         # Try to initialize ChromaDB
@@ -31,49 +144,33 @@ def initialize_chroma():
         return vectorstore
     except Exception as e:
         print(f"Error initializing ChromaDB: {e}")
-        print("Attempting to clean up and reinitialize...")
+        print("Attempting to create new database...")
         
-        try:
-            # Backup the existing database
-            backup_path = f"{CHROMA_DB_PATH}_backup"
-            if os.path.exists(CHROMA_DB_PATH):
-                # Try to remove the backup directory if it exists
-                if os.path.exists(backup_path):
-                    try:
-                        shutil.rmtree(backup_path)
-                    except Exception as backup_error:
-                        print(f"Warning: Could not remove existing backup: {backup_error}")
-                
-                # Try to copy instead of move
-                try:
-                    shutil.copytree(CHROMA_DB_PATH, backup_path)
-                    shutil.rmtree(CHROMA_DB_PATH)
-                except Exception as copy_error:
-                    print(f"Warning: Could not backup database: {copy_error}")
-                    # If backup fails, try to just remove the directory
-                    try:
-                        shutil.rmtree(CHROMA_DB_PATH)
-                    except Exception as remove_error:
-                        print(f"Warning: Could not remove database directory: {remove_error}")
-                        # If all else fails, try to create a new directory with a different name
-                        CHROMA_DB_PATH = f"{CHROMA_DB_PATH}_new"
+        # Generate new database path
+        new_db_path = get_new_db_path()
+        print(f"Creating new database at: {new_db_path}")
         
-        except Exception as cleanup_error:
-            print(f"Error during cleanup: {cleanup_error}")
-            # If cleanup fails, try to use a new directory
-            CHROMA_DB_PATH = f"{CHROMA_DB_PATH}_new"
+        # Create new database directory
+        os.makedirs(new_db_path, exist_ok=True)
         
-        # Create a new database
-        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
+        # Register old database for cleanup
+        if CHROMA_DB_PATH != BASE_CHROMA_DB_PATH:
+            register_cleanup(CHROMA_DB_PATH)
+        
+        # Update global path
+        CHROMA_DB_PATH = new_db_path
+        
+        # Create new ChromaDB instance
         vectorstore = Chroma(
             embedding_function=embeddings,
             persist_directory=CHROMA_DB_PATH,
             collection_name="rag_collection"
         )
+        
         return vectorstore
 
 # Initialize ChromaDB with error handling
-vectorstore = initialize_chroma()
+vectorstore = initialize_chroma(force_recreate=True)  # Force recreate on first run
 
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
@@ -88,8 +185,8 @@ def process_and_embed_pdf(pdf_file_path: str) -> bool:
     """
     try:
         print(f"Processing PDF: {pdf_file_path}")
-        # loader = PyPDFLoader(pdf_file_path) # 간단한 텍스트 추출
-        loader = UnstructuredPDFLoader(pdf_file_path, mode="elements") # 이미지, 테이블 등 고려
+        # PyPDFLoader 사용 (더 안정적인 PDF 처리)
+        loader = PyPDFLoader(pdf_file_path)
         
         docs = loader.load()
         
@@ -103,11 +200,9 @@ def process_and_embed_pdf(pdf_file_path: str) -> bool:
                 for js_code in js_codes:
                     python_code = convert_js_to_python_code(js_code, llm_coding)
                     # 원본 JS 코드를 변환된 Python 코드로 대체
-                    # 주의: 이 방식은 매우 단순하며, 복잡한 문서 구조에서는 부정확할 수 있음
                     content = content.replace(js_code, f"\n'''\nOriginal JavaScript:\n{js_code}\n'''\n\n'''\nConverted Python:\n{python_code}\n'''\n")
                 
                 # 변환된 내용을 포함하는 새 Document 객체 생성 또는 기존 Document 업데이트
-                # 여기서는 간단히 page_content를 업데이트합니다.
                 doc.page_content = content
 
             processed_docs.append(doc)
@@ -132,7 +227,7 @@ def process_and_embed_pdf(pdf_file_path: str) -> bool:
         traceback.print_exc()
         return False
 
-def query_rag(query: str, k: int = 5) -> List[Document]:
+def get_relevant_documents(query: str, k: int = 5) -> List[Document]:
     """Vector DB에서 관련 문서를 검색합니다."""
     try:
         retriever = vectorstore.as_retriever(search_kwargs={"k": k})
@@ -142,7 +237,22 @@ def query_rag(query: str, k: int = 5) -> List[Document]:
         print(f"Error querying RAG: {e}")
         return []
 
+def query_pdf_content(query: str, k: int = 5) -> str:
+    """PDF 내용을 검색하고 관련 내용을 반환합니다."""
+    try:
+        docs = get_relevant_documents(query, k)
+        if not docs:
+            return "관련된 PDF 내용을 찾을 수 없습니다."
+        
+        # 관련 문서 내용을 하나의 문자열로 결합
+        content = "\n\n".join([doc.page_content for doc in docs])
+        return content
+    except Exception as e:
+        print(f"Error querying PDF content: {e}")
+        return "PDF 내용을 검색하는 중 오류가 발생했습니다."
+
 def get_rag_retriever(k: int = 5):
+    """RAG 검색기 인스턴스를 반환합니다."""
     return vectorstore.as_retriever(search_kwargs={"k": k})
 
 def list_available_collections():
@@ -156,3 +266,16 @@ def list_available_collections():
 print(f"ChromaDB initialized. Available collections: {list_available_collections()}")
 if not any(col == "rag_collection" for col in list_available_collections()):
     print("Warning: 'rag_collection' not found. PDFs might need to be re-uploaded.")
+
+def get_processed_pdfs() -> List[Dict]:
+    """
+    처리된 PDF 파일 목록을 반환합니다.
+    """
+    return [
+        {
+            "filename": info["filename"],
+            "id": info["id"],
+            "status": pdf_metadata[info["id"]]["status"]
+        }
+        for info in pdf_index.values()
+    ]
